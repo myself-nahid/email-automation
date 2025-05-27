@@ -1,0 +1,17 @@
+# Core dependencies
+fastapi
+uvicorn
+pydantic
+openai
+numpy
+python-dateutil
+faiss-cpu
+databases
+sqlalchemy
+aiosqlite
+tenacity
+python-dotenv
+setuptools
+wheel
+typing-extensions
+pydantic[email]
