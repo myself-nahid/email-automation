@@ -1,252 +1,469 @@
+# --- START OF FILE main.py ---
+# from app.openai_client import get_embedding # Old import if you also have chat_completion
+from app.openai_client import get_embedding, chat_completion # Corrected import
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 from app.models import EmailInput, QuestionRequest, ChatMessage
-from app.email_processor import process_email
-from app.faiss_index import faiss_index
+from app.email_processor import process_email, ProcessEmailError # Import custom error
+from app.faiss_index import faiss_index # Assuming faiss_index is an instance
 from app.db import (
-    database, upsert_email, get_email_by_id, 
-    get_emails_in_date_range, 
-    migrate_database
+    database, upsert_email, get_email_by_id,
+    migrate_database, get_emails_in_date_range, metadata, engine # Added get_emails_in_date_range
 )
-# Use the real functions from your other files
 from app.chat_manager import add_message, get_chat_history
 from app.openai_client import chat_completion
-
-from datetime import datetime, timedelta
+import faiss
+from datetime import datetime, timedelta, timezone
 import asyncio
 import numpy as np
-import faiss 
+# import faiss # Not directly used here, faiss_index abstracts it
 import traceback
 import re
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# Configure CORS
 origins = [
-    "http://localhost",
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "http://192.168.10.190:3000",
-    "http://192.168.10.12:3000"
+    "http://localhost", "http://localhost:3000", "http://127.0.0.1:3000",
+    "http://192.168.10.190:3000", "http://192.168.10.12:3000"
 ]
-
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    CORSMiddleware, allow_origins=origins, allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
 @app.on_event("startup")
 async def startup():
     await database.connect()
-    await migrate_database()
+    # Create all tables defined in metadata if they don't exist.
+    # For production, Alembic or similar is better for managing schema changes.
+    metadata.create_all(engine) # from db.py
+    await migrate_database() # Apply column additions
+    try:
+        faiss_index.load() # Attempt to load FAISS index from disk
+    except Exception as e:
+        logger.error(f"Failed to load FAISS index on startup: {e}", exc_info=True)
+
 
 @app.on_event("shutdown")
 async def shutdown():
     await database.disconnect()
+    try:
+        faiss_index.save() # Attempt to save FAISS index on shutdown
+    except Exception as e:
+        logger.error(f"Failed to save FAISS index on shutdown: {e}", exc_info=True)
+
 
 @app.get("/")
 async def read_root():
     return {"message": "Welcome to the AI Email Assistant API"}
 
-# Token estimation function
 def estimate_tokens(text: str) -> int:
-    """Rough estimation: ~4 characters per token for English text"""
-    return len(text) // 4
+    return len(text) // 4 # Rough estimate
 
 def truncate_email_content(email: dict, max_chars: int = 800) -> dict:
-    """Truncate email content to fit within token limits while preserving key info"""
     email_copy = email.copy()
+    body = str(email_copy.get('body') or email_copy.get('full_text', '')) # Ensure body is string
+
+    if len(body) <= max_chars:
+        email_copy['body'] = body
+        return email_copy
+
+    priority_keywords = [
+        'meeting', 'interview', 'call', 'appointment', 'conference', 'zoom', 'teams', 'calendar',
+        'schedule', 'invite', 'time', 'date', 'event', 'urgent', 'important', 'action required',
+        'deadline', 'asap', 'critical', 'response needed', 'follow up', 'invoice', 'payment',
+        'receipt', 'alert', 'update', 'confirm', 'booking', 'summary', 'report',
+        'next week', 'tomorrow', 'today', 'this week', 'next month',
+    ]
     
-    # Always preserve these fields in full
-    preserve_fields = ['email_id', 'account_id', 'subject', 'from_', 'received_at']
+    sentences = re.split(r'(?<=[.!?])\s+', body)
+    prioritized_sentences = []
+    other_sentences = []
     
-    # Get body content
-    body = email_copy.get('body') or email_copy.get('full_text', '')
+    for sentence_clean in sentences:
+        if not sentence_clean.strip(): continue
+        has_date_pattern = re.search(r'\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2}\b|\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b|\b\d{1,2}-\d{1,2}(?:-\d{2,4})?\b', sentence_clean, re.IGNORECASE)
+        if any(keyword in sentence_clean.lower() for keyword in priority_keywords) or has_date_pattern:
+            prioritized_sentences.append(sentence_clean)
+        else:
+            other_sentences.append(sentence_clean)
     
-    if len(body) > max_chars:
-        # Try to find the most important part of the email
-        # Look for scheduling/meeting keywords first
-        meeting_keywords = [
-            'meeting', 'interview', 'call', 'appointment', 'conference', 
-            'zoom', 'teams', 'calendar', 'schedule', 'invite', 'time', 'date'
-        ]
-        
-        # Split into sentences and prioritize those with meeting keywords
-        sentences = re.split(r'[.!?]+', body)
-        important_sentences = []
-        other_sentences = []
-        
-        for sentence in sentences:
-            sentence = sentence.strip()
-            if any(keyword in sentence.lower() for keyword in meeting_keywords):
-                important_sentences.append(sentence)
-            else:
-                other_sentences.append(sentence)
-        
-        # Start with important sentences
-        truncated = '. '.join(important_sentences)
-        
-        # Add other sentences if we have space
-        remaining_chars = max_chars - len(truncated)
-        if remaining_chars > 100:  # Only if we have decent space left
-            additional_text = '. '.join(other_sentences)
-            if len(additional_text) <= remaining_chars:
-                truncated += '. ' + additional_text
-            else:
-                truncated += '. ' + additional_text[:remaining_chars-20] + '...'
-        
-        # If truncated is still empty or too short, just take the beginning
-        if len(truncated) < 50:
-            truncated = body[:max_chars] + '...' if len(body) > max_chars else body
-            
-        email_copy['body'] = truncated
-        if 'full_text' in email_copy:
-            email_copy['full_text'] = truncated
+    truncated_parts = []
+    current_len = 0
+    ellipsis = "..."
+    ellipsis_len = len(ellipsis)
+
+    for s_list in [prioritized_sentences, other_sentences]:
+        for s in s_list:
+            s_len = len(s)
+            if current_len + s_len + (1 if truncated_parts else 0) <= max_chars - ellipsis_len:
+                truncated_parts.append(s)
+                current_len += s_len + (1 if len(truncated_parts) > 1 else 0)
+            elif not truncated_parts:
+                truncated_parts.append(s[:max_chars - ellipsis_len])
+                current_len = max_chars - ellipsis_len
+                break
+        if current_len >= max_chars - ellipsis_len: break
     
+    if truncated_parts:
+        truncated_body = ' '.join(truncated_parts)
+        if len(body) > len(truncated_body) :
+             truncated_body += ellipsis
+    else: 
+        truncated_body = body[:max_chars - ellipsis_len] + ellipsis
+        
+    email_copy['body'] = truncated_body
     return email_copy
 
-def build_smart_context(emails: List[dict], max_total_tokens=3000) -> str:
-    """
-    Build a concise, structured context string from emails focusing on
-    date, subject, and a short snippet from the body to keep token count manageable.
-    """
+def build_smart_context(emails: List[dict], max_total_tokens=2500) -> str:
     context_parts = []
     total_tokens = 0
 
     for email in emails:
-        date = email.get('received_at', 'Unknown date')
-        subject = email.get('subject', 'No subject').strip()
-        body = email.get('body', '').strip().replace('\n', ' ').replace('\r', ' ')
-
-        # Take first 200 chars for snippet to limit length
-        snippet = (body[:200] + '...') if len(body) > 200 else body
-
-        part = f"- Date: {date}\n  Subject: {subject}\n  Snippet: {snippet}"
+        date_str = email.get('received_at', 'Unknown date')
+        if isinstance(date_str, datetime): date_str = date_str.isoformat()
         
-        # Rough token estimate: 1 token ~ 4 chars (safe overestimate)
-        estimated_tokens = len(part) // 4
+        subject = str(email.get('subject', 'No subject')).strip()
+        body_snippet = str(email.get('body', '')).strip()
         
-        if total_tokens + estimated_tokens > max_total_tokens:
+        unread_status_val = email.get('is_unread')
+        status_str = ""
+        if unread_status_val is True: status_str = "Status: Unread\n  "
+        elif unread_status_val is False: status_str = "Status: Read\n  "
+        # If None, status_str remains empty, so "Status:" line won't appear
+
+        part = f"- Date Received: {date_str}\n  From: {email.get('from_', 'Unknown sender')}\n  Subject: {subject}\n  {status_str}Body Snippet: {body_snippet}"
+        estimated_tokens_part = estimate_tokens(part)
+        
+        if total_tokens + estimated_tokens_part > max_total_tokens:
+            if not context_parts:
+                max_chars_for_part_strict = int(max_total_tokens * 3.5)
+                if len(part) > max_chars_for_part_strict:
+                    header_len = len(f"- Date Received: {date_str}\n  From: {email.get('from_', 'Unknown sender')}\n  Subject: {subject}\n  {status_str}Body Snippet: ")
+                    remaining_chars_for_body = max_chars_for_part_strict - header_len - len("\n[SNIPPET TRUNCATED]")
+                    if remaining_chars_for_body > 20:
+                        body_snippet = body_snippet[:remaining_chars_for_body] + "..."
+                        part = f"- Date Received: {date_str}\n  From: {email.get('from_', 'Unknown sender')}\n  Subject: {subject}\n  {status_str}Body Snippet: {body_snippet}\n[SNIPPET TRUNCATED]"
+                    else:
+                        part = f"- Date Received: {date_str}\n  From: {email.get('from_', 'Unknown sender')}\n  Subject: {subject}\n[SNIPPET OMITTED]"
+                    estimated_tokens_part = estimate_tokens(part)
+                if estimated_tokens_part <= max_total_tokens:
+                    context_parts.append(part)
+                    total_tokens += estimated_tokens_part
             break
-
         context_parts.append(part)
-        total_tokens += estimated_tokens
-
+        total_tokens += estimated_tokens_part
     return "\n\n".join(context_parts)
 
-
-from datetime import datetime, timedelta
-from typing import List
-
-def filter_recent_emails(emails: List[dict], days_ahead: int = 7) -> List[dict]:
-    """Filter emails to focus on those likely to contain upcoming events"""
-    if not emails:
-        return emails
-    
-    now = datetime.utcnow()
-    cutoff_date = now - timedelta(days=30)  # Look at emails from last 30 days
-    future_cutoff = now + timedelta(days=days_ahead)
-    
+def filter_recent_emails(emails: List[dict], days_ahead: int = 14, lookback_days: int = 30) -> List[dict]:
+    if not emails: return []
+    now_utc = datetime.now(timezone.utc)
+    past_cutoff_utc = now_utc - timedelta(days=lookback_days)
+    future_cutoff_for_received_at = now_utc + timedelta(days=days_ahead)
     filtered_emails = []
     
     for email in emails:
         email_date_raw = email.get('received_at', '')
-        if not email_date_raw:
-            continue
-        
-        email_date = None
+        if not email_date_raw: continue
+        email_date_dt_utc = None
         try:
             if isinstance(email_date_raw, str):
-                # Handle 'Z' timezone designator in ISO format
-                if 'Z' in email_date_raw:
-                    email_date = datetime.fromisoformat(email_date_raw.replace('Z', '+00:00'))
-                else:
-                    email_date = datetime.fromisoformat(email_date_raw)
+                temp_dt = datetime.fromisoformat(email_date_raw.replace('Z', '+00:00')) if email_date_raw.endswith('Z') else datetime.fromisoformat(email_date_raw)
+                email_date_dt_aware = temp_dt.replace(tzinfo=timezone.utc) if temp_dt.tzinfo is None else temp_dt
+            elif isinstance(email_date_raw, datetime):
+                email_date_dt_aware = email_date_raw.replace(tzinfo=timezone.utc) if email_date_raw.tzinfo is None else email_date_raw
             elif isinstance(email_date_raw, (int, float)):
-                # Assume Unix timestamp in seconds
-                email_date = datetime.utcfromtimestamp(email_date_raw)
-            else:
-                # Unknown type, skip
-                continue
-            
-            # Make naive datetime for comparison (remove tzinfo)
-            if email_date.tzinfo is not None:
-                email_date = email_date.replace(tzinfo=None)
-            
-            # Filter emails recent enough or possibly with upcoming events
-            if cutoff_date <= email_date <= future_cutoff:
+                email_date_dt_aware = datetime.fromtimestamp(email_date_raw, tz=timezone.utc)
+            else: continue
+            email_date_dt_utc = email_date_dt_aware.astimezone(timezone.utc)
+            if past_cutoff_utc <= email_date_dt_utc <= future_cutoff_for_received_at:
                 filtered_emails.append(email)
-        
         except Exception as e:
-            # On parsing error, log and skip or include email
-            print(f"Error parsing email date '{email_date_raw}': {e}")
-            # Optionally include to be safe:
-            # filtered_emails.append(email)
+            logger.warning(f"Date parsing error in filter_recent_emails for email {email.get('email_id')}: {e}")
             continue
-    
     return filtered_emails
 
 
-# (The /emails/batch_add endpoint remains the same as previously provided)
-@app.post("/emails/batch_add")
-async def batch_add_emails(emails: List[EmailInput]):
-    print(f"Received {len(emails)} emails for batch processing.")
+
+
+
+def enhanced_truncate_email_content(email: dict, max_chars: int = 1000) -> dict:
+    """Enhanced email truncation that preserves important information"""
+    email_copy = email.copy()
+    body = str(email_copy.get('body') or email_copy.get('full_text', ''))
+    
+    if len(body) <= max_chars:
+        email_copy['body'] = body
+        return email_copy
+
+    # Enhanced priority keywords for better content preservation
+    priority_keywords = [
+        # Meeting/Event keywords
+        'meeting', 'interview', 'call', 'appointment', 'conference', 'zoom', 'teams', 
+        'calendar', 'schedule', 'invite', 'webinar', 'session', 'demo',
+        
+        # Time-related keywords
+        'time', 'date', 'when', 'at', 'on', 'tomorrow', 'today', 'next week', 
+        'this week', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday',
+        
+        # Urgency keywords
+        'urgent', 'important', 'action required', 'deadline', 'asap', 'critical',
+        'high priority', 'response needed', 'follow up',
+        
+        # Business keywords
+        'invoice', 'payment', 'receipt', 'alert', 'update', 'confirm', 'booking',
+        'summary', 'report', 'project', 'client', 'customer'
+    ]
+    
+    # Split into sentences and prioritize
+    sentences = re.split(r'(?<=[.!?])\s+', body)
+    high_priority = []
+    medium_priority = []
+    low_priority = []
+    
+    for sentence in sentences:
+        if not sentence.strip():
+            continue
+            
+        sentence_lower = sentence.lower()
+        
+        # Check for date patterns (high priority)
+        date_pattern = re.search(
+            r'\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|'
+            r'Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)'
+            r'\s+\d{1,2}(?:st|nd|rd|th)?\b|\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b|'
+            r'\b\d{1,2}-\d{1,2}(?:-\d{2,4})?\b|\b(?:tomorrow|today|next\s+week|this\s+week)\b',
+            sentence_lower, re.IGNORECASE
+        )
+        
+        # Check for time patterns (high priority)
+        time_pattern = re.search(
+            r'\b\d{1,2}:\d{2}\s*(?:am|pm|AM|PM)?\b|\b(?:morning|afternoon|evening|noon)\b',
+            sentence_lower, re.IGNORECASE
+        )
+        
+        # Priority classification
+        priority_count = sum(1 for keyword in priority_keywords if keyword in sentence_lower)
+        
+        if date_pattern or time_pattern or priority_count >= 2:
+            high_priority.append(sentence)
+        elif priority_count >= 1:
+            medium_priority.append(sentence)
+        else:
+            low_priority.append(sentence)
+    
+    # Build truncated content
+    result_sentences = []
+    current_length = 0
+    ellipsis = "..."
+    
+    # Add sentences in priority order
+    for priority_group in [high_priority, medium_priority, low_priority]:
+        for sentence in priority_group:
+            sentence_length = len(sentence)
+            if current_length + sentence_length + len(ellipsis) <= max_chars:
+                result_sentences.append(sentence)
+                current_length += sentence_length + 1  # +1 for space
+            else:
+                # If this is the first sentence and it's too long, truncate it
+                if not result_sentences and current_length == 0:
+                    truncated_sentence = sentence[:max_chars - len(ellipsis)]
+                    result_sentences.append(truncated_sentence)
+                    current_length = len(truncated_sentence)
+                break
+        
+        if current_length >= max_chars - len(ellipsis):
+            break
+    
+    # Join sentences and add ellipsis if needed
+    truncated_body = ' '.join(result_sentences)
+    if len(body) > len(truncated_body):
+        truncated_body += ellipsis
+    
+    email_copy['body'] = truncated_body
+    return email_copy
+
+
+def enhanced_build_smart_context(emails: List[dict], max_total_tokens=2500) -> str:
+    """Enhanced context building with better formatting for AI understanding"""
     if not emails:
+        return "No emails available for analysis."
+    
+    context_parts = []
+    total_tokens = 0
+    
+    for i, email in enumerate(emails, 1):
+        # Format date consistently
+        date_str = email.get('received_at', 'Unknown date')
+        if isinstance(date_str, datetime):
+            date_str = date_str.strftime('%Y-%m-%d %H:%M:%S UTC')
+        
+        # Get email details
+        subject = str(email.get('subject', 'No subject')).strip()
+        sender = str(email.get('from_', 'Unknown sender')).strip()
+        body = str(email.get('body', '')).strip()
+        
+        # Format unread status more clearly
+        unread_status = email.get('is_unread')
+        if unread_status is True:
+            status = "UNREAD"
+        elif unread_status is False:
+            status = "READ"
+        else:
+            status = "STATUS_UNKNOWN"
+        
+        # Build email entry
+        email_entry = f"""EMAIL {i}:
+Date: {date_str}
+From: {sender}
+Subject: {subject}
+Status: {status}
+Content: {body}
+---"""
+        
+        # Check token limit
+        estimated_tokens = estimate_tokens(email_entry)
+        if total_tokens + estimated_tokens > max_total_tokens:
+            if not context_parts:  # At least include one email, even if truncated
+                # Truncate the body to fit
+                available_tokens = max_total_tokens - total_tokens
+                available_chars = int(available_tokens * 3.5)  # Rough char to token ratio
+                
+                header_text = f"""EMAIL {i}:
+Date: {date_str}
+From: {sender}
+Subject: {subject}
+Status: {status}
+Content: """
+                
+                remaining_chars = available_chars - len(header_text) - 20  # Buffer
+                if remaining_chars > 50:
+                    truncated_body = body[:remaining_chars] + "...[TRUNCATED]"
+                    email_entry = header_text + truncated_body + "\n---"
+                    context_parts.append(email_entry)
+            break
+        
+        context_parts.append(email_entry)
+        total_tokens += estimated_tokens
+    
+    return "\n\n".join(context_parts)
+
+
+# Enhanced date range query function
+async def get_emails_in_date_range_enhanced(
+    start_date: datetime, 
+    end_date: datetime, 
+    account_id: Optional[str] = None,
+    is_unread: Optional[bool] = None,
+    keywords: Optional[List[str]] = None,
+    limit: int = 50
+):
+    """Enhanced date range query with additional filters"""
+    
+    conditions = ["received_at >= :start_date", "received_at <= :end_date"]
+    params = {
+        "start_date": start_date,
+        "end_date": end_date
+    }
+    
+    if account_id:
+        conditions.append("account_id = :account_id")
+        params["account_id"] = account_id
+    
+    if is_unread is not None:
+        conditions.append("is_unread = :is_unread")
+        params["is_unread"] = is_unread
+    
+    if keywords:
+        keyword_conditions = []
+        for idx, keyword in enumerate(keywords):
+            subj_param = f"keyword_subj_{idx}"
+            body_param = f"keyword_body_{idx}"
+            keyword_conditions.append(f"(LOWER(subject) LIKE :{subj_param} OR LOWER(body) LIKE :{body_param})")
+            params[subj_param] = f"%{keyword.lower()}%"
+            params[body_param] = f"%{keyword.lower()}%"
+        
+        if keyword_conditions:
+            conditions.append(f"({' OR '.join(keyword_conditions)})")
+    
+    where_clause = " AND ".join(conditions)
+    query = f"SELECT * FROM emails WHERE {where_clause} ORDER BY received_at DESC LIMIT :limit"
+    params["limit"] = limit
+    
+    try:
+        return await database.fetch_all(query, values=params)
+    except Exception as e:
+        logger.error(f"Enhanced date range query failed: {e}")
+        return []
+    
+
+    
+
+@app.post("/emails/batch_add")
+async def batch_add_emails(emails_input: List[EmailInput]): # Renamed for clarity
+    logger.info(f"Received {len(emails_input)} emails for batch processing.")
+    if not emails_input:
         return {"added": 0, "failed": 0, "message": "No emails provided."}
     
-    email_ids_for_faiss = []
-    embeddings_bytes_for_faiss = []
-    successful_emails_info = []
-    failed_emails_info = []
-    
-    for email_input in emails:
-        try:
-            email_data_dict = email_input.dict() 
-            processed_email_metadata = await process_email(email_data_dict)
-            await upsert_email(processed_email_metadata)
-            
-            email_ids_for_faiss.append(processed_email_metadata['email_id'])
-            embeddings_bytes_for_faiss.append(processed_email_metadata['embedding'])
-            successful_emails_info.append({
-                "email_id": email_input.id, 
-                "account_id": email_input.account_id
-            })
-            
-        except Exception as e:
-            failed_emails_info.append({
-                "email_id": email_input.id, 
-                "account_id": email_input.account_id,
-                "error": str(e)
-            })
-            continue 
+    processed_count = 0
+    failed_count = 0
+    faiss_add_ids = []
+    faiss_add_embeddings = []
 
-    if email_ids_for_faiss and embeddings_bytes_for_faiss:
+    for email_in_model in emails_input:
         try:
-            faiss_index.add(email_ids_for_faiss, embeddings_bytes_for_faiss)
+            # Convert Pydantic model to dict for process_email
+            email_data_dict = email_in_model.model_dump(by_alias=True) # Use model_dump for Pydantic v2
+            
+            # Ensure account_id is present (models.py should enforce this if not optional)
+            if not email_data_dict.get('account_id'):
+                logger.error(f"Skipping email ID {email_in_model.id}: account_id missing.")
+                failed_count +=1
+                continue
+
+            processed_metadata = await process_email(email_data_dict)
+            await upsert_email(processed_metadata)
+            
+            if 'embedding' in processed_metadata and processed_metadata['embedding']:
+                faiss_add_ids.append(processed_metadata['email_id'])
+                faiss_add_embeddings.append(processed_metadata['embedding'])
+            processed_count += 1
+        except ProcessEmailError as e: # Catch specific processing error
+            logger.error(f"Processing failed for email ID {email_in_model.id}: {e}")
+            failed_count += 1
         except Exception as e:
-            return {
-                "added_to_db": len(successful_emails_info),
-                "failed_processing": len(failed_emails_info),
-                "successful_emails": successful_emails_info,
-                "failed_emails": failed_emails_info,
-                "faiss_error": str(e),
-                "message": "Emails processed and saved to DB, but FAISS indexing failed."
-            }
+            logger.error(f"Unexpected error during batch add for email ID {email_in_model.id}: {e}", exc_info=True)
+            failed_count += 1
+            
+    if faiss_add_ids:
+        try:
+            faiss_index.add(faiss_add_ids, faiss_add_embeddings)
+            # faiss_index.save() # Save after each batch add, or less frequently depending on volume
+        except Exception as e:
+            logger.error(f"FAISS add operation failed: {e}", exc_info=True)
+            # Decide if this is a critical failure for the whole batch response
+
+    # Save FAISS index once after processing all emails in the batch
+    if faiss_add_ids: # only save if new items were potentially added
+        try:
+            faiss_index.save()
+            logger.info(f"FAISS index saved. Total vectors: {faiss_index.index.ntotal if faiss_index.index else 'N/A'}")
+        except Exception as e:
+             logger.error(f"FAISS save operation failed: {e}", exc_info=True)
+
 
     return {
-        "added_to_db": len(successful_emails_info),
-        "failed_processing": len(failed_emails_info),
-        "successful_emails": successful_emails_info,
-        "failed_emails": failed_emails_info,
-        "faiss_total_after_add": faiss_index.index.ntotal if hasattr(faiss_index, 'index') else "FAISS not initialized"
+        "processed": processed_count, "failed": failed_count,
+        "faiss_total_after_add": faiss_index.index.ntotal if hasattr(faiss_index, 'index') and faiss_index.index else "FAISS N/A"
     }
 
-
 async def get_total_email_count(account_id: Optional[str] = None):
+    # ... (same as before)
     try:
         if account_id:
             query = "SELECT COUNT(*) as count FROM emails WHERE account_id = :account_id"
@@ -256,380 +473,463 @@ async def get_total_email_count(account_id: Optional[str] = None):
             result = await database.fetch_one(query)
         return result['count'] if result else 0
     except Exception as e:
-        print(f"Error getting email count: {str(e)}")
+        logger.error(f"Error getting email count: {str(e)}")
         return 0
 
+# --- Query Endpoint Configuration ---
+MAX_TOKEN_BUDGET = 4096
+PROMPT_SYSTEM_AND_USER_ESTIMATE = 560 # Adjusted based on shorter system prompt + avg q
+ANSWER_TOKEN_RESERVE = 800
+MAX_CONTEXT_TOKEN_FOR_EMAILS = MAX_TOKEN_BUDGET - PROMPT_SYSTEM_AND_USER_ESTIMATE - ANSWER_TOKEN_RESERVE
+AVG_TOKENS_PER_EMAIL_IN_CONTEXT = 220 # Estimate for one email entry in the context string
+# Calculate how many emails can roughly fit, then fetch a bit more
+EMAILS_FOR_CONTEXT_TARGET_COUNT = max(1, MAX_CONTEXT_TOKEN_FOR_EMAILS // AVG_TOKENS_PER_EMAIL_IN_CONTEXT)
+MAX_EMAILS_TO_FETCH_INITIAL = max(15, EMAILS_FOR_CONTEXT_TARGET_COUNT * 2 + 5)
 
-MAX_TOKEN_BUDGET = 4000
-PROMPT_TOKEN_ESTIMATE = 500
-ANSWER_TOKEN_RESERVE = 1000
-TOKENS_PER_EMAIL_ESTIMATE = 100
+logger.info(f"Token Config: MAX_TOKEN_BUDGET={MAX_TOKEN_BUDGET}, PROMPT_SYSTEM_AND_USER_ESTIMATE={PROMPT_SYSTEM_AND_USER_ESTIMATE}, MAX_CONTEXT_TOKEN_FOR_EMAILS={MAX_CONTEXT_TOKEN_FOR_EMAILS}, EMAILS_FOR_CONTEXT_TARGET_COUNT={EMAILS_FOR_CONTEXT_TARGET_COUNT}, MAX_EMAILS_TO_FETCH_INITIAL={MAX_EMAILS_TO_FETCH_INITIAL}")
+
+
+# Key improvements for the /query/working endpoint
 
 @app.post("/query/working")
 async def working_query(request: QuestionRequest):
     try:
         faiss_search_successful = False
-        emails_for_context = []
+        emails_for_context_raw = []
         account_id_filter = request.account_id
+        query_lower = request.question.lower()
         
-        # print(f"Query received: '{request.question}' for account: {account_id_filter or 'all'}")
+        logger.info(f"Query: '{request.question}', Account: {account_id_filter or 'all'}")
 
-        # Calculate max emails to include based on token budget
-        max_emails_to_use = (MAX_TOKEN_BUDGET - PROMPT_TOKEN_ESTIMATE - ANSWER_TOKEN_RESERVE) // TOKENS_PER_EMAIL_ESTIMATE
-        max_emails_to_use = max(10, max_emails_to_use)  # at least 10 emails
+        # Enhanced query classification
+        is_unread_query = any(keyword in query_lower for keyword in ["unread", "haven't read", "not read"])
+        is_urgent_query = any(keyword in query_lower for keyword in ["urgent", "important", "action required", "deadline", "asap", "critical"])
+        is_event_query = any(keyword in query_lower for keyword in [
+            'meeting', 'interview', 'call', 'appointment', 'conference', 'zoom', 'teams', 
+            'scheduled', 'calendar', 'upcoming', 'event', 'invite', 'webinar', 'tomorrow',
+            'today', 'next week', 'this week', 'next 7 days', 'next two weeks'
+        ])
 
         if request.email_id:
+            # Specific email lookup
             doc = await get_email_by_id(request.email_id, account_id=account_id_filter)
-            if doc:
-                emails_for_context.append(dict(doc))
+            if doc: 
+                emails_for_context_raw.append(dict(doc))
+            logger.info(f"Retrieved specific email ID: {request.email_id}, Found: {bool(doc)}")
         else:
-            # Try FAISS vector search first
-            if hasattr(faiss_index, 'index') and faiss_index.index.ntotal > 0:
+            # Multi-strategy email retrieval
+            
+            # Strategy 1: FAISS Search (for content-based queries)
+            if not is_unread_query and hasattr(faiss_index, 'index') and faiss_index.index and faiss_index.index.ntotal > 0:
                 try:
                     q_embedding_data = await process_email({
-                        'id': 'query_temp_id',
+                        'id': 'query_temp_id', 
                         'account_id': account_id_filter or 'general_query_account',
-                        'subject': '', 'from_': '', 'body': request.question,
-                        'date': datetime.utcnow().isoformat()
-                    })
-                    top_k = 100  # Retrieve more, but we will limit later
-                    top_ids = faiss_index.search(np.frombuffer(q_embedding_data['embedding'], dtype=np.float32), top_k=top_k)
+                        'subject': request.question, 
+                        'from_': 'user_query', 
+                        'body': request.question,
+                        'date': datetime.now(timezone.utc).isoformat()
+                    }, generate_embedding_only=True)
 
-                    print(f"FAISS search returned {len(top_ids)} email IDs")
+                    if q_embedding_data and 'embedding' in q_embedding_data:
+                        embedding_array = np.frombuffer(q_embedding_data['embedding'], dtype=np.float32).reshape(1, -1)
+                        distances, top_faiss_email_ids = faiss_index.search_with_scores(
+                            embedding_array, top_k=MAX_EMAILS_TO_FETCH_INITIAL, account_id=account_id_filter
+                        )
+                        logger.info(f"FAISS search returned {len(top_faiss_email_ids)} email IDs.")
+                        for eid in top_faiss_email_ids:
+                            doc = await get_email_by_id(eid, account_id=account_id_filter)
+                            if doc: 
+                                emails_for_context_raw.append(dict(doc))
+                        if emails_for_context_raw:
+                            faiss_search_successful = True
+                            logger.info(f"FAISS: Fetched {len(emails_for_context_raw)} emails from DB.")
+                except Exception as e: 
+                    logger.error(f"FAISS search failed: {e}", exc_info=True)
 
-                    for eid in top_ids[:max_emails_to_use]:
-                        doc = await get_email_by_id(eid, account_id=account_id_filter)
-                        if doc:
-                            emails_for_context.append(dict(doc))
-
-                    if emails_for_context:
-                        faiss_search_successful = True
-                        print(f"FAISS search successful: found {len(emails_for_context)} emails")
-                    else:
-                        print("FAISS returned IDs but no matching emails found in DB")
-
-                except Exception as e:
-                    print(f"FAISS search failed: {str(e)}")
-
-            # If FAISS search failed or no emails found, fallback to DB query
-            if not faiss_search_successful:
-                # print("Using enhanced database fallback for query.")
+            # Strategy 2: Database queries for specific types
+            db_emails_added = False
+            
+            if is_unread_query:
+                # Enhanced unread email query
                 try:
-                    query_lower = request.question.lower()
-
-                    meeting_keywords = ['meeting', 'interview', 'call', 'appointment', 'conference', 'zoom', 'teams', 'scheduled', 'calendar', 'upcoming']
-                    is_meeting_query = any(keyword in query_lower for keyword in meeting_keywords)
-
+                    # Parse time range from query
+                    days_match = re.search(r'last\s+(\d+)\s+days?|past\s+(\d+)\s+days?', query_lower)
+                    lookback_days = int(days_match.group(1) or days_match.group(2)) if days_match else 7
+                    
+                    end_date = datetime.now(timezone.utc)
+                    start_date = end_date - timedelta(days=lookback_days)
+                    
+                    db_emails = await get_emails_in_date_range(
+                        start_date, end_date, 
+                        account_id=account_id_filter, 
+                        is_unread=True
+                    )
+                    emails_for_context_raw.extend([dict(row) for row in db_emails])
+                    db_emails_added = True
+                    logger.info(f"DB Unread Query: Found {len(db_emails)} unread emails in last {lookback_days} days.")
+                except Exception as e:
+                    logger.error(f"Unread email query failed: {e}", exc_info=True)
+            
+            elif is_urgent_query:
+                # Query for urgent/important emails
+                try:
+                    urgent_keywords = ['urgent', 'important', 'action required', 'deadline', 'asap', 'critical', 'high priority']
                     conditions = []
                     params = {}
-
+                    
                     if account_id_filter:
                         conditions.append("account_id = :account_id")
                         params["account_id"] = account_id_filter
-
-                    if is_meeting_query:
-                        meeting_condition = """(
-                            LOWER(subject) LIKE :meeting1 OR LOWER(body) LIKE :meeting2 OR
-                            LOWER(subject) LIKE :interview1 OR LOWER(body) LIKE :interview2 OR
-                            LOWER(subject) LIKE :call1 OR LOWER(body) LIKE :call2 OR
-                            LOWER(subject) LIKE :appointment1 OR LOWER(body) LIKE :appointment2 OR
-                            LOWER(subject) LIKE :conference1 OR LOWER(body) LIKE :conference2 OR
-                            LOWER(subject) LIKE :zoom1 OR LOWER(body) LIKE :zoom2 OR
-                            LOWER(subject) LIKE :teams1 OR LOWER(body) LIKE :teams2 OR
-                            LOWER(subject) LIKE :calendar1 OR LOWER(body) LIKE :calendar2 OR
-                            LOWER(subject) LIKE :schedule1 OR LOWER(body) LIKE :schedule2 OR
-                            LOWER(subject) LIKE :invite1 OR LOWER(body) LIKE :invite2
-                        )"""
-                        conditions.append(meeting_condition)
-                        params.update({
-                            'meeting1': '%meeting%', 'meeting2': '%meeting%',
-                            'interview1': '%interview%', 'interview2': '%interview%',
-                            'call1': '%call%', 'call2': '%call%',
-                            'appointment1': '%appointment%', 'appointment2': '%appointment%',
-                            'conference1': '%conference%', 'conference2': '%conference%',
-                            'zoom1': '%zoom%', 'zoom2': '%zoom%',
-                            'teams1': '%teams%', 'teams2': '%teams%',
-                            'calendar1': '%calendar%', 'calendar2': '%calendar%',
-                            'schedule1': '%schedule%', 'schedule2': '%schedule%',
-                            'invite1': '%invite%', 'invite2': '%invite%'
-                        })
-                        limit = max_emails_to_use * 2  # fetch more to have buffer
-                        order_by = "received_at DESC"
-                    else:
-                        conditions.append("received_at >= datetime('now', '-14 days')")
-                        limit = max_emails_to_use * 2
-                        order_by = "received_at DESC"
-
-                    where_clause = " AND ".join(conditions) if conditions else "1=1"
-
-                    fallback_query_sql = f"""
-                        SELECT * FROM emails
-                        WHERE {where_clause}
-                        ORDER BY {order_by}
-                        LIMIT {limit}
-                    """
-
-                    # print(f"Database fallback query: {fallback_query_sql}")
-                    # print(f"Query parameters: {params}")
-
-                    fallback_results = await database.fetch_all(fallback_query_sql, values=params)
-
-                    # Optional: sort or filter fallback_results if needed here
-
-                    # Limit to max_emails_to_use
-                    emails_for_context.extend([dict(row) for row in fallback_results[:max_emails_to_use]])
-
-                    # print(f"Database fallback found {len(emails_for_context)} emails")
-
+                    
+                    # Look for urgent keywords in subject or body
+                    keyword_conditions = []
+                    for idx, keyword in enumerate(urgent_keywords):
+                        subj_param = f"urgent_subj_{idx}"
+                        body_param = f"urgent_body_{idx}"
+                        keyword_conditions.append(f"(LOWER(subject) LIKE :{subj_param} OR LOWER(body) LIKE :{body_param})")
+                        params[subj_param] = f"%{keyword}%"
+                        params[body_param] = f"%{keyword}%"
+                    
+                    conditions.append(f"({' OR '.join(keyword_conditions)})")
+                    
+                    # Recent emails (last 30 days)
+                    recent_date = datetime.now(timezone.utc) - timedelta(days=30)
+                    conditions.append("received_at >= :recent_date")
+                    params["recent_date"] = recent_date
+                    
+                    where_clause = " AND ".join(conditions)
+                    urgent_query_sql = f"SELECT * FROM emails WHERE {where_clause} ORDER BY received_at DESC LIMIT {MAX_EMAILS_TO_FETCH_INITIAL}"
+                    
+                    urgent_results = await database.fetch_all(urgent_query_sql, values=params)
+                    emails_for_context_raw.extend([dict(row) for row in urgent_results])
+                    db_emails_added = True
+                    logger.info(f"DB Urgent Query: Found {len(urgent_results)} urgent emails.")
                 except Exception as e:
-                    print(f"Database fallback failed: {str(e)}")
-                    traceback.print_exc()
+                    logger.error(f"Urgent email query failed: {e}", exc_info=True)
+            
+            elif is_event_query:
+                # Enhanced event/meeting query
+                try:
+                    event_keywords = [
+                        'meeting', 'interview', 'call', 'appointment', 'conference', 'zoom', 'teams',
+                        'scheduled', 'calendar', 'event', 'invite', 'webinar', 'session', 'demo'
+                    ]
+                    conditions = []
+                    params = {}
+                    
+                    if account_id_filter:
+                        conditions.append("account_id = :account_id")
+                        params["account_id"] = account_id_filter
+                    
+                    keyword_conditions = []
+                    for idx, keyword in enumerate(event_keywords):
+                        subj_param = f"event_subj_{idx}"
+                        body_param = f"event_body_{idx}"
+                        keyword_conditions.append(f"(LOWER(subject) LIKE :{subj_param} OR LOWER(body) LIKE :{body_param})")
+                        params[subj_param] = f"%{keyword}%"
+                        params[body_param] = f"%{keyword}%"
+                    
+                    conditions.append(f"({' OR '.join(keyword_conditions)})")
+                    
+                    # Look in future and recent past for events
+                    past_date = datetime.now(timezone.utc) - timedelta(days=7)
+                    future_date = datetime.now(timezone.utc) + timedelta(days=30)
+                    conditions.append("received_at >= :past_date")
+                    params["past_date"] = past_date
+                    
+                    where_clause = " AND ".join(conditions)
+                    event_query_sql = f"SELECT * FROM emails WHERE {where_clause} ORDER BY received_at DESC LIMIT {MAX_EMAILS_TO_FETCH_INITIAL}"
+                    
+                    event_results = await database.fetch_all(event_query_sql, values=params)
+                    emails_for_context_raw.extend([dict(row) for row in event_results])
+                    db_emails_added = True
+                    logger.info(f"DB Event Query: Found {len(event_results)} event-related emails.")
+                except Exception as e:
+                    logger.error(f"Event email query failed: {e}", exc_info=True)
 
-        # Remove duplicates
+            # Strategy 3: General fallback if no specific strategy worked
+            if not faiss_search_successful and not db_emails_added:
+                try:
+                    logger.info("Using general fallback query")
+                    general_query = "SELECT * FROM emails"
+                    params = {}
+                    
+                    if account_id_filter:
+                        general_query += " WHERE account_id = :account_id"
+                        params["account_id"] = account_id_filter
+                    
+                    general_query += f" ORDER BY received_at DESC LIMIT {MAX_EMAILS_TO_FETCH_INITIAL}"
+                    general_results = await database.fetch_all(general_query, values=params)
+                    emails_for_context_raw.extend([dict(row) for row in general_results])
+                    logger.info(f"General fallback: Found {len(general_results)} emails.")
+                except Exception as e:
+                    logger.error(f"General fallback failed: {e}", exc_info=True)
+
+        # Deduplicate emails
         seen_ids = set()
         unique_emails = []
-        for email in emails_for_context:
-            if email['email_id'] not in seen_ids:
-                unique_emails.append(email)
-                seen_ids.add(email['email_id'])
-        emails_for_context = unique_emails
+        for email_dict in emails_for_context_raw:
+            if isinstance(email_dict, dict) and email_dict.get('email_id') not in seen_ids:
+                unique_emails.append(email_dict)
+                seen_ids.add(email_dict['email_id'])
+        
+        logger.info(f"Unique emails after retrieval: {len(unique_emails)}")
 
-        # print(f"Unique emails before filtering: {len(emails_for_context)}")
+        # Apply recency filtering based on query type
+        if is_event_query:
+            # For event queries, look further back but also forward
+            filtered_emails = filter_recent_emails(unique_emails, days_ahead=30, lookback_days=60)
+        elif is_urgent_query:
+            # For urgent queries, focus on recent emails
+            filtered_emails = filter_recent_emails(unique_emails, days_ahead=7, lookback_days=14)
+        elif is_unread_query:
+            # For unread queries, we already filtered by date in DB query
+            filtered_emails = unique_emails
+        else:
+            # General queries
+            filtered_emails = filter_recent_emails(unique_emails, lookback_days=30)
 
-        # Filter emails for recency and relevance
-        emails_for_context = filter_recent_emails(emails_for_context)
+        logger.info(f"Emails after filtering: {len(filtered_emails)}")
 
-        # print(f"Final email context count after filtering: {len(emails_for_context)}")
+        # Handle case where no emails found
+        if not filtered_emails:
+            db_count = await get_total_email_count(account_id=account_id_filter)
+            message = f"I couldn't find any relevant emails for your query."
+            if account_id_filter:
+                message += f" (Searched account: {account_id_filter})"
+            message += f" Total emails in database: {db_count}"
+            
+            return {"answer": message, "emails_used_count": 0}
 
-        if not emails_for_context:
-            db_email_count = await get_total_email_count(account_id=account_id_filter)
-
-            try:
-                broad_query = "SELECT * FROM emails"
-                broad_params = {}
-                if account_id_filter:
-                    broad_query += " WHERE account_id = :account_id"
-                    broad_params["account_id"] = account_id_filter
-                broad_query += " ORDER BY received_at DESC LIMIT 10"
-
-                broad_results = await database.fetch_all(broad_query, values=broad_params)
-                emails_for_context = [dict(row) for row in broad_results]
-
-                if emails_for_context:
-                    print(f"Broad search found {len(emails_for_context)} emails for general context")
-
-            except Exception as e:
-                print(f"Broad search failed: {str(e)}")
-
-        if not emails_for_context:
-            return {
-                "answer": f"I couldn't find any emails to analyze. Database shows {db_email_count} total emails for account '{account_id_filter or 'all'}'. This might indicate an issue with email processing or database connectivity.",
-                "emails": []
-            }
-
-        context_text = build_smart_context(emails_for_context, max_total_tokens=3000)
-
-        current_date = datetime.now().strftime('%Y-%m-%d')
-        current_time = datetime.now().strftime('%Y-%m-%d %H:%M')
-
-        system_prompt = f"""
-You are an AI email assistant analyzing emails for upcoming meetings and events. You can also give some basic questions like Hello, How are you etc.
+        # Build context with improved truncation
+        truncated_emails = [truncate_email_content(email.copy(), max_chars=1000) for email in filtered_emails]
+        context_text = build_smart_context(truncated_emails, max_total_tokens=MAX_CONTEXT_TOKEN_FOR_EMAILS)
+        
+        # Enhanced system prompt
+        current_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')
+        
+        system_prompt = f"""You are an AI Email Assistant analyzing email data to answer user questions.
 
 Current date and time: {current_time}
 
-TASK:
-- Find upcoming meetings, interviews, or calls within the next 7 days by analyzing ONLY the emails provided below.
-- Find upcoming meetings, interviews, or calls within the next 14 days by analyzing ONLY the emails provided below.
-- Find upcoming meetings, interviews, or calls within the next 21 days by analyzing ONLY the emails provided below.
-- Find upcoming meetings, interviews, or calls within the next 28 days by analyzing ONLY the emails provided below.
-- Find upcoming meetings, interviews, or calls within the next 15 days by analyzing ONLY the emails provided below.
-- Find upcoming meetings, interviews, or calls within the next 30 days by analyzing ONLY the emails provided below.
-- Find upcoming meetings, interviews, or calls within the next 3 days by analyzing ONLY the emails provided below.
+ANALYSIS GUIDELINES:
+1. **Upcoming Events**: For questions about meetings, calls, interviews, appointments:
+   - Look for date/time information in email content
+   - Calculate timeframes relative to current date: {current_time}
+   - Extract: Date, Time, Type, Participants, Subject, Location/Links
+   - Pay attention to phrases like "next week", "tomorrow", "this Friday"
 
-IMPORTANT:
-- Only use the provided emails for your answer.
-- Do NOT guess or assume info not present in these emails.
-- Provide clear event details including: Date, Time, Type (meeting/interview/call), Participants, Subject, Location or Link.
-- Use ISO 8601 format for dates and times if possible.
-- Use bullet points if multiple events.
-- If no upcoming meetings or calls are found, respond: "After analyzing your emails, I found no upcoming meetings, interviews, or calls scheduled for the next 7 days."
+2. **Urgent/Important Items**: For questions about urgent emails or deadlines:
+   - Look for keywords: "urgent", "important", "action required", "deadline", "ASAP"
+   - Identify required actions and deadlines
+   - Prioritize unread urgent emails
 
-EMAILS TO ANALYZE:
-{context_text}
-"""
+3. **Email Status**: For read/unread questions:
+   - Use "Status: Unread" or "Status: Read" information when provided
+   - Count unread emails accurately
 
-        total_estimated_tokens = estimate_tokens(system_prompt) + estimate_tokens(request.question)
-        # print(f"Estimated tokens for request: {total_estimated_tokens}")
+4. **General Queries**: Answer based solely on provided email content
+   - Do not invent or assume information not in the emails
+   - If information is not available, state this clearly
 
-        messages_for_ai = []
+RESPONSE FORMAT:
+- Be specific and actionable
+- Include relevant details (dates, times, participants)
+- Use bullet points for multiple items
+- Mention if information is from email snippets
+
+EMAIL DATA TO ANALYZE:
+{context_text if context_text else "No email data available."}
+
+Answer the user's question based ONLY on the email information provided above."""
+
+        # Prepare messages for LLM
+        messages = []
+        
+        # Add conversation history if available
         if request.conversation_id:
             try:
                 history = await get_chat_history(request.conversation_id)
-                recent_history = history[-4:] if len(history) > 4 else history
-                for m in recent_history:
-                    messages_for_ai.append({"role": m['role'], "content": m['content']})
+                for msg in history[-4:]:  # Last 4 messages for context
+                    messages.append({"role": msg['role'], "content": msg['content']})
             except Exception as e:
-                print(f"Error loading chat history: {str(e)}")
+                logger.warning(f"Error loading chat history: {e}")
 
-        messages_for_ai.append({"role": "system", "content": system_prompt})
-        messages_for_ai.append({"role": "user", "content": request.question})
+        messages.extend([
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": request.question}
+        ])
 
-        total_message_tokens = sum(estimate_tokens(msg["content"]) for msg in messages_for_ai)
-        # print(f"Final estimated tokens: {total_message_tokens}")
+        # Call LLM with better error handling
+        try:
+            answer = await chat_completion(messages)
+            
+            if not answer or not isinstance(answer, str) or not answer.strip():
+                logger.error("LLM returned invalid response")
+                answer = "I'm having trouble processing your request. Please try rephrasing your question."
+            
+            logger.info(f"Generated answer length: {len(answer)} chars")
+            
+        except Exception as llm_error:
+            logger.error(f"LLM error: {llm_error}", exc_info=True)
+            answer = "I'm experiencing technical difficulties. Please try again in a moment."
 
-        answer = await chat_completion(messages_for_ai)
-
-        if request.conversation_id:
+        # Save conversation history
+        if request.conversation_id and answer:
             try:
                 await add_message(request.conversation_id, "user", request.question)
                 await add_message(request.conversation_id, "assistant", answer)
             except Exception as e:
-                print(f"Error saving chat history: {str(e)}")
+                logger.warning(f"Error saving chat history: {e}")
 
         return {
             "answer": answer,
-            # "debug_info": {
-            #     "account_queried": account_id_filter or "all",
-            #     "emails_found": len(emails_for_context),
-            #     "estimated_tokens": total_message_tokens,
-            #     "faiss_total": faiss_index.index.ntotal if hasattr(faiss_index, 'index') else "N/A",
-            #     "search_method": "faiss" if faiss_search_successful else "database_fallback"
-            # }
+            "emails_used_count": len(truncated_emails),
+            "query_type_detected": {
+                "unread_query": is_unread_query,
+                "urgent_query": is_urgent_query,
+                "event_query": is_event_query
+            }
         }
 
     except Exception as e:
-        print(f"Query error in /query/working: {str(e)}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
-
-
+        logger.error(f"Query processing error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Query processing failed: {str(e)}")
 # --- Admin/Debug Endpoints ---
+# (Keep debug/status and rebuild-faiss as they were, or simplify rebuild if it's problematic)
+# Ensure they use logger.
+# Example for rebuild-faiss, simplified to remove per-account complexity for now:
+@app.post("/admin/rebuild-faiss-from-db")
+async def rebuild_faiss_from_database_admin():
+    logger.info(f"Starting GLOBAL FAISS rebuild admin task.")
+    try:
+        query_sql = "SELECT email_id, embedding FROM emails WHERE embedding IS NOT NULL"
+        result = await database.fetch_all(query_sql)
+        
+        if not result:
+            msg = "No emails with embeddings found in database for FAISS rebuild."
+            logger.warning(msg)
+            return {"success": False, "message": msg}
+        
+        logger.info(f"Found {len(result)} emails with embeddings in DB for FAISS rebuild.")
+        
+        DIM = faiss_index.dim if hasattr(faiss_index, 'dim') else 1536 # Use dim from faiss_index instance
+        
+        # Reinitialize global FAISS index
+        faiss_index.index = faiss.IndexFlatL2(DIM) 
+        faiss_index.id_map = [] 
+        
+        email_ids_for_faiss = []
+        embeddings_list_for_faiss = []         
+        valid_embeddings_count = 0
+        invalid_embeddings_details = []
+        expected_byte_length = DIM * np.dtype(np.float32).itemsize
+        
+        for row in result:
+            email_id = row['email_id']
+            embedding_data = row['embedding']
+            if embedding_data and isinstance(embedding_data, bytes) and len(embedding_data) == expected_byte_length:
+                try:
+                    np_embedding = np.frombuffer(embedding_data, dtype=np.float32)
+                    embeddings_list_for_faiss.append(np_embedding) 
+                    email_ids_for_faiss.append(email_id) 
+                    valid_embeddings_count += 1
+                except Exception as e_np:
+                    invalid_embeddings_details.append({"email_id": email_id, "error": f"Numpy conversion failed: {str(e_np)}"})
+            else:
+                invalid_embeddings_details.append({
+                    "email_id": email_id, "embedding_present": bool(embedding_data),
+                    "type": str(type(embedding_data)), "length_bytes": len(embedding_data) if embedding_data else 0,
+                    "expected_length_bytes": expected_byte_length, "reason": "Invalid type or length"
+                })
+        
+        if not embeddings_list_for_faiss:
+            logger.warning("No valid embeddings found to add to FAISS index during rebuild.")
+            return {"success": False, "message": "No valid embeddings found.", "invalid_samples": invalid_embeddings_details[:5]}
+        
+        all_embeddings_np = np.array(embeddings_list_for_faiss).astype(np.float32)
+        if all_embeddings_np.ndim == 1 and all_embeddings_np.size > 0: # Handle single embedding case
+             all_embeddings_np = all_embeddings_np.reshape(1, -1)
+        
+        if all_embeddings_np.size > 0 : # Only add if there's data
+            faiss_index.index.add(all_embeddings_np)
+            faiss_index.id_map.extend(email_ids_for_faiss)
+        
+        faiss_index.save()
+        logger.info("Global FAISS index rebuilt and saved successfully.")
+        
+        return {
+            "success": True, "message": "Global FAISS index rebuilt successfully.",
+            "db_embeddings_found": len(result),
+            "faiss_added_valid": valid_embeddings_count,
+            "faiss_total_after_rebuild": faiss_index.index.ntotal,
+            "invalid_embeddings_count": len(invalid_embeddings_details),
+        }
+    except Exception as e:
+        logger.error(f"Error in /admin/rebuild-faiss-from-db: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
 
 @app.get("/debug/status")
 async def debug_status(account_id: Optional[str] = None):
-    """Comprehensive debug status, optionally filtered by account_id."""
+    # ... (Keep this endpoint mostly as is, just ensure it uses logger)
     try:
         total_emails_in_db = await get_total_email_count(account_id=account_id)
         
         # Check emails with embeddings
+        query_with_emb = "SELECT COUNT(*) as count FROM emails WHERE embedding IS NOT NULL"
+        params_with_emb = {}
         if account_id:
-            query_with_emb = "SELECT COUNT(*) as count FROM emails WHERE embedding IS NOT NULL AND account_id = :account_id"
+            query_with_emb += " AND account_id = :account_id"
             params_with_emb = {"account_id": account_id}
-        else:
-            query_with_emb = "SELECT COUNT(*) as count FROM emails WHERE embedding IS NOT NULL"
-            params_with_emb = {}
         result_with_emb = await database.fetch_one(query_with_emb, values=params_with_emb)
         emails_with_embeddings = result_with_emb['count'] if result_with_emb else 0
         
         # Sample recent emails
+        query_recent = "SELECT email_id, account_id, subject, from_, received_at, is_unread FROM emails" # Added is_unread
+        params_recent = {}
         if account_id:
-            query_recent = "SELECT email_id, account_id, subject, from_, received_at FROM emails WHERE account_id = :account_id ORDER BY received_at DESC LIMIT 5"
+            query_recent += " WHERE account_id = :account_id"
             params_recent = {"account_id": account_id}
-        else:
-            query_recent = "SELECT email_id, account_id, subject, from_, received_at FROM emails ORDER BY received_at DESC LIMIT 5"
-            params_recent = {}
-        recent_emails_db = await database.fetch_all(query_recent, values=params_recent)
+        query_recent += " ORDER BY received_at DESC LIMIT 5"
+        recent_emails_db_rows = await database.fetch_all(query_recent, values=params_recent)
+        recent_emails_db = [dict(row) for row in recent_emails_db_rows]
         
+        faiss_total = "FAISS N/A"
+        faiss_id_map_len = "FAISS N/A"
+        faiss_sample_ids = []
+        if hasattr(faiss_index, 'index') and faiss_index.index:
+            faiss_total = faiss_index.index.ntotal
+        if hasattr(faiss_index, 'id_map'):
+            faiss_id_map_len = len(faiss_index.id_map)
+            if faiss_index.id_map: # Check if id_map is not empty
+                 faiss_sample_ids = faiss_index.id_map[:min(5, len(faiss_index.id_map))]
+
+
         return {
             "filter_account_id": account_id or "all_accounts",
             "database": {
                 "total_emails": total_emails_in_db,
                 "emails_with_embeddings": emails_with_embeddings,
-                "recent_emails": [dict(row) for row in recent_emails_db]
+                "recent_emails_sample": recent_emails_db
             },
             "faiss": {
-                "index_total": faiss_index.index.ntotal if hasattr(faiss_index, 'index') else "FAISS not initialized",
-                "id_map_length": len(faiss_index.id_map) if hasattr(faiss_index, 'id_map') else "N/A",
-                "sample_ids_from_map": faiss_index.id_map[:5] if hasattr(faiss_index, 'id_map') and faiss_index.id_map else []
+                "index_total_vectors": faiss_total,
+                "id_map_length": faiss_id_map_len,
+                "sample_ids_from_map_head": faiss_sample_ids,
+                "dim": faiss_index.dim if hasattr(faiss_index, 'dim') else "N/A"
             },
-            "potential_issues": {
-                "faiss_empty": not (hasattr(faiss_index, 'index') and faiss_index.index.ntotal > 0),
-                "missing_embeddings_in_db": emails_with_embeddings < total_emails_in_db,
-                "faiss_db_embedding_mismatch": hasattr(faiss_index, 'index') and faiss_index.index.ntotal != emails_with_embeddings if total_emails_in_db > 0 else "N/A (no emails in DB or embeddings count mismatch)"
-            }
+            "token_budget_config_for_query": {
+                "MAX_TOKEN_BUDGET": MAX_TOKEN_BUDGET,
+                "PROMPT_SYSTEM_AND_USER_ESTIMATE": PROMPT_SYSTEM_AND_USER_ESTIMATE,
+                "ANSWER_TOKEN_RESERVE": ANSWER_TOKEN_RESERVE,
+                "MAX_CONTEXT_TOKEN_FOR_EMAILS": MAX_CONTEXT_TOKEN_FOR_EMAILS,
+                "EMAILS_FOR_CONTEXT_TARGET_COUNT": EMAILS_FOR_CONTEXT_TARGET_COUNT,
+                "MAX_EMAILS_TO_FETCH_INITIAL": MAX_EMAILS_TO_FETCH_INITIAL,
+            },
         }
     except Exception as e:
-        print(f"Error in /debug/status: {str(e)}")
-        return {"error": str(e)}
+        logger.error(f"Error in /debug/status: {str(e)}", exc_info=True)
+        return {"error": f"Failed to get debug status: {str(e)}"}
 
-
-@app.post("/admin/rebuild-faiss-from-db")
-async def rebuild_faiss_from_database_admin():
-    """Rebuild FAISS index from all emails with embeddings in database."""
-    try:
-        # Get all emails with embeddings
-        query = "SELECT email_id, embedding FROM emails WHERE embedding IS NOT NULL"
-        result = await database.fetch_all(query)
-        
-        if not result:
-            return {
-                "success": False,
-                "message": "No emails with embeddings found in database.",
-                "action_needed": "Ensure emails are processed and embeddings are generated (e.g., via /emails/batch_add or a dedicated embedding generation endpoint)."
-            }
-        
-        print(f"Found {len(result)} emails with embeddings in DB for FAISS rebuild.")
-        
-        # Clear existing FAISS index
-        # Ensure faiss_index and its components are accessible and correctly typed
-        if not hasattr(faiss_index, 'index') or not hasattr(faiss_index, 'id_map'):
-             return {"success": False, "message": "FAISS index object not properly initialized."}
-
-        # Reinitialize FAISS index (assuming DIM is defined, e.g., 1536 for OpenAI)
-        DIM = 1536 # Or get from faiss_index.index.d if already initialized
-        faiss_index.index = faiss.IndexFlatL2(DIM) 
-        faiss_index.id_map = []
-        
-        email_ids_for_faiss = []
-        embeddings_bytes_for_faiss = []
-        
-        valid_embeddings_count = 0
-        invalid_embeddings_details = []
-        
-        for row in result:
-            email_id = row['email_id']
-            embedding_data = row['embedding']
-            
-            # Validate embedding data (e.g., correct byte length for 1536 float32)
-            expected_byte_length = DIM * 4 # 1536 floats * 4 bytes/float
-            if embedding_data and isinstance(embedding_data, bytes) and len(embedding_data) == expected_byte_length:
-                email_ids_for_faiss.append(email_id)
-                embeddings_bytes_for_faiss.append(embedding_data)
-                valid_embeddings_count += 1
-            else:
-                invalid_embeddings_details.append({
-                    "email_id": email_id, 
-                    "embedding_present": bool(embedding_data),
-                    "type": str(type(embedding_data)),
-                    "length": len(embedding_data) if embedding_data else 0,
-                    "expected_length": expected_byte_length
-                })
-        
-        if not email_ids_for_faiss:
-            return {
-                "success": False,
-                "message": "No valid embeddings found to add to FAISS index after filtering.",
-                "total_from_db_with_embedding_column": len(result),
-                "invalid_embedding_samples": invalid_embeddings_details[:5] # Show first 5 issues
-            }
-        
-        # Add to FAISS index
-        faiss_index.add(email_ids_for_faiss, embeddings_bytes_for_faiss)
-        faiss_index.save() # Assuming a save method exists in your FaissIndex class
-        
-        return {
-            "success": True,
-            "message": "FAISS index rebuilt successfully.",
-            "total_from_db_with_embedding_column": len(result),
-            "valid_embeddings_added_to_faiss": valid_embeddings_count,
-            "faiss_index_total_after_rebuild": faiss_index.index.ntotal,
-            "faiss_id_map_length_after_rebuild": len(faiss_index.id_map),
-            "invalid_embedding_details_count": len(invalid_embeddings_details),
-            "invalid_embedding_samples": invalid_embeddings_details[:5]
-        }
-        
-    except Exception as e:
-        print(f"Error in /admin/rebuild-faiss-from-db: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return {"success": False, "error": f"FAISS rebuild failed: {str(e)}"}
+# --- END OF FILE main.py ---
