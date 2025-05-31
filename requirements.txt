@@ -1,7 +1,7 @@
 # Core dependencies
-fastapi
-uvicorn
-pydantic
+fastapi>=0.109.0
+uvicorn>=0.27.0
+pydantic>=2.5.0
 openai
 numpy
 python-dateutil
@@ -14,4 +14,4 @@ python-dotenv
 setuptools
 wheel
 typing-extensions
-pydantic[email]
+email-validator>=2.1.0
