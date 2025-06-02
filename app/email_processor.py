@@ -94,30 +94,30 @@ async def process_email(email_data: dict, generate_embedding_only: bool = False)
             raise ProcessEmailError(f"'account_id' is missing for email {email_id}.")
         account_id = account_id or "temp_query_account"
 
-    # logger.info(f"Processing email: {email_id} for account: {account_id}, generate_embedding_only: {generate_embedding_only}")
-    
     try:
         metadata = extract_metadata(email_data, account_id)
         
-        text_for_embedding = f"Subject: {metadata.get('subject', '')}\nFrom: {metadata.get('from_', '')}\nBody: {metadata.get('body', '')[:2000]}"
+        # Only generate embedding if explicitly requested or if this is a new email
+        if generate_embedding_only or not email_data.get('skip_embedding', False):
+            text_for_embedding = f"Subject: {metadata.get('subject', '')}\nFrom: {metadata.get('from_', '')}\nBody: {metadata.get('body', '')[:2000]}"
 
-        embedding_vector = await get_embedding(text_for_embedding)
-        if embedding_vector is None or not isinstance(embedding_vector, np.ndarray):
-            logger.error(f"Embedding generation failed for email {email_id}. get_embedding returned: {embedding_vector}")
-            raise ProcessEmailError(f"Embedding generation failed for email {email_id}.")
+            embedding_vector = await get_embedding(text_for_embedding)
+            if embedding_vector is None or not isinstance(embedding_vector, np.ndarray):
+                logger.error(f"Embedding generation failed for email {email_id}. get_embedding returned: {embedding_vector}")
+                raise ProcessEmailError(f"Embedding generation failed for email {email_id}.")
 
-        embedding_bytes = embedding_to_bytes(embedding_vector)
+            embedding_bytes = embedding_to_bytes(embedding_vector)
+            metadata['embedding'] = embedding_bytes
+            metadata['full_text_for_embedding'] = text_for_embedding
+        else:
+            logger.info(f"Skipping embedding generation for email {email_id} as requested")
 
         if generate_embedding_only:
             return {
                 "email_id": metadata['email_id'],
-                "embedding": embedding_bytes
+                "embedding": metadata.get('embedding')
             }
 
-        metadata['embedding'] = embedding_bytes
-        metadata['full_text_for_embedding'] = text_for_embedding
-        
-        # logger.info(f"Successfully processed email {metadata['email_id']} (Account: {metadata['account_id']})")
         return metadata
         
     except Exception as e:

@@ -412,6 +412,7 @@ async def batch_add_emails(emails_input: List[EmailInput]): # Renamed for clarit
     
     processed_count = 0
     failed_count = 0
+    skipped_count = 0
     faiss_add_ids = []
     faiss_add_embeddings = []
 
@@ -420,20 +421,55 @@ async def batch_add_emails(emails_input: List[EmailInput]): # Renamed for clarit
             # Convert Pydantic model to dict for process_email
             email_data_dict = email_in_model.model_dump(by_alias=True) # Use model_dump for Pydantic v2
             
-            # Ensure account_id is present (models.py should enforce this if not optional)
+            # Ensure account_id is present
             if not email_data_dict.get('account_id'):
                 logger.error(f"Skipping email ID {email_in_model.id}: account_id missing.")
-                failed_count +=1
+                failed_count += 1
                 continue
 
-            processed_metadata = await process_email(email_data_dict)
+            # Check if email already exists in database
+            existing_email = await get_email_by_id(email_data_dict['id'], account_id=email_data_dict['account_id'])
+            
+            if existing_email:
+                # Check if we need to update the email (e.g., if is_unread status changed)
+                needs_update = False
+                if email_data_dict.get('is_unread') is not None and existing_email.get('is_unread') != email_data_dict['is_unread']:
+                    needs_update = True
+                    logger.info(f"Email {email_data_dict['id']} needs update: is_unread status changed")
+                
+                if not needs_update:
+                    logger.info(f"Skipping existing email ID {email_data_dict['id']}")
+                    skipped_count += 1
+                    continue
+                
+                # If we have an existing email with embedding, reuse it
+                if existing_email.get('embedding'):
+                    processed_metadata = {
+                        'email_id': email_data_dict['id'],
+                        'account_id': email_data_dict['account_id'],
+                        'subject': email_data_dict.get('subject', existing_email.get('subject', '')),
+                        'from_': email_data_dict.get('from_', existing_email.get('from_', '')),
+                        'body': email_data_dict.get('body', existing_email.get('body', '')),
+                        'received_at': email_data_dict.get('date', existing_email.get('received_at')),
+                        'is_unread': email_data_dict.get('is_unread'),
+                        'embedding': existing_email['embedding'],
+                        'full_text_for_embedding': existing_email.get('full_text_for_embedding', '')
+                    }
+                else:
+                    # Process email to generate embedding if missing
+                    processed_metadata = await process_email(email_data_dict)
+            else:
+                # Process new email
+                processed_metadata = await process_email(email_data_dict)
+            
             await upsert_email(processed_metadata)
             
             if 'embedding' in processed_metadata and processed_metadata['embedding']:
                 faiss_add_ids.append(processed_metadata['email_id'])
                 faiss_add_embeddings.append(processed_metadata['embedding'])
             processed_count += 1
-        except ProcessEmailError as e: # Catch specific processing error
+            
+        except ProcessEmailError as e:
             logger.error(f"Processing failed for email ID {email_in_model.id}: {e}")
             failed_count += 1
         except Exception as e:
@@ -443,22 +479,21 @@ async def batch_add_emails(emails_input: List[EmailInput]): # Renamed for clarit
     if faiss_add_ids:
         try:
             faiss_index.add(faiss_add_ids, faiss_add_embeddings)
-            # faiss_index.save() # Save after each batch add, or less frequently depending on volume
         except Exception as e:
             logger.error(f"FAISS add operation failed: {e}", exc_info=True)
-            # Decide if this is a critical failure for the whole batch response
 
     # Save FAISS index once after processing all emails in the batch
-    if faiss_add_ids: # only save if new items were potentially added
+    if faiss_add_ids:
         try:
             faiss_index.save()
             logger.info(f"FAISS index saved. Total vectors: {faiss_index.index.ntotal if faiss_index.index else 'N/A'}")
         except Exception as e:
-             logger.error(f"FAISS save operation failed: {e}", exc_info=True)
-
+            logger.error(f"FAISS save operation failed: {e}", exc_info=True)
 
     return {
-        "processed": processed_count, "failed": failed_count,
+        "processed": processed_count,
+        "failed": failed_count,
+        "skipped": skipped_count,
         "faiss_total_after_add": faiss_index.index.ntotal if hasattr(faiss_index, 'index') and faiss_index.index else "FAISS N/A"
     }
 
