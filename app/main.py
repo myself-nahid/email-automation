@@ -978,4 +978,11 @@ async def mark_email_status(email_id: str, status_update: EmailStatusUpdate, acc
     
     await update_email_status(email_id, status_update.is_unread, account_id)
     return {"message": f"Email {email_id} status updated successfully."}
+
+@app.get("/emails/{email_id}")
+async def get_single_email(email_id: str, account_id: str): # account_id should come from auth
+    email = await get_email_by_id(email_id, account_id=account_id)
+    if not email:
+        raise HTTPException(status_code=404, detail="Email not found or access denied.")
+    return email
 # --- END OF FILE main.py ---
