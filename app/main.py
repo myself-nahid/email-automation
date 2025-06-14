@@ -4,12 +4,12 @@ from app.openai_client import get_embedding, chat_completion # Corrected import
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
-from app.models import EmailInput, QuestionRequest, ChatMessage
+from app.models import EmailInput, QuestionRequest, ChatMessage, EmailStatusUpdate
 from app.email_processor import process_email, ProcessEmailError # Import custom error
 from app.faiss_index import faiss_index # Assuming faiss_index is an instance
 from app.db import (
     database, upsert_email, get_email_by_id,
-    migrate_database, get_emails_in_date_range, metadata, engine # Added get_emails_in_date_range
+    migrate_database, get_emails_in_date_range,  update_email_status, metadata, engine # Added get_emails_in_date_range
 )
 from app.chat_manager import add_message, get_chat_history
 from app.openai_client import chat_completion
@@ -967,4 +967,15 @@ async def debug_status(account_id: Optional[str] = None):
         logger.error(f"Error in /debug/status: {str(e)}", exc_info=True)
         return {"error": f"Failed to get debug status: {str(e)}"}
 
+
+
+@app.patch("/emails/{email_id}/status")
+async def mark_email_status(email_id: str, status_update: EmailStatusUpdate, account_id: str): # account_id should be from auth
+    # In a real app, account_id would come from a dependency injection that verifies the user's token
+    existing_email = await get_email_by_id(email_id, account_id=account_id)
+    if not existing_email:
+        raise HTTPException(status_code=404, detail="Email not found or access denied.")
+    
+    await update_email_status(email_id, status_update.is_unread, account_id)
+    return {"message": f"Email {email_id} status updated successfully."}
 # --- END OF FILE main.py ---

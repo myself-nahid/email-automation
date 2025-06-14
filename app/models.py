@@ -48,6 +48,9 @@ class EmailInput(BaseModel): # This is the one used by /emails/batch_add
         # alias_generator = lambda field_name: 'from' if field_name == 'from_' else field_name
         # allow_population_by_field_name = True
 
+class EmailStatusUpdate(BaseModel):
+    is_unread: bool
+
 
 class QuestionRequest(BaseModel):
     question: str

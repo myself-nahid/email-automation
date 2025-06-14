@@ -246,3 +246,14 @@ async def get_chat_history(conversation_id: str, limit: int = 20):
     )
     rows = await database.fetch_all(query)
     return list(reversed(rows))  # Reverse to get oldest first for chat display
+
+
+async def update_email_status(email_id: str, is_unread: bool, account_id: str):
+    query = (
+        emails.update()
+        .where(emails.c.email_id == email_id)
+        .where(emails.c.account_id == account_id) # Important for security
+        .values(is_unread=is_unread)
+    )
+    await database.execute(query)
+    logger.info(f"Updated is_unread status for email {email_id} to {is_unread}")
