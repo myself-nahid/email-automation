@@ -747,12 +747,12 @@ Answer the user's question based ONLY on the email information provided above.""
 
         return {
             "answer": answer,
-            "emails_used_count": len(truncated_emails),
-            "query_type_detected": {
-                "unread_query": is_unread_query,
-                "urgent_query": is_urgent_query,
-                "event_query": is_event_query
-            }
+            # "emails_used_count": len(truncated_emails),
+            # "query_type_detected": {
+            #     "unread_query": is_unread_query,
+            #     "urgent_query": is_urgent_query,
+            #     "event_query": is_event_query
+            # }
         }
 
     except Exception as e:
