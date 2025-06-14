@@ -731,11 +731,11 @@ async def working_query(request: QuestionRequest):
         if not filtered_emails:
             db_count = await get_total_email_count(account_id=account_id_filter)
             message = f"I couldn't find any relevant emails for your query."
-            if account_id_filter:
-                message += f" (Searched account: {account_id_filter})"
-            message += f" Total emails in database: {db_count}"
+            # if account_id_filter:
+            #     message += f" (Searched account: {account_id_filter})"
+            # message += f" Total emails in database: {db_count}"
             
-            return {"answer": message, "emails_used_count": 0}
+            return {"answer": message}
 
         # Build context with improved truncation
         truncated_emails = [truncate_email_content(email.copy(), max_chars=1000) for email in filtered_emails]
