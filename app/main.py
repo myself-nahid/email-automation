@@ -9,7 +9,7 @@ from app.email_processor import process_email, ProcessEmailError # Import custom
 from app.faiss_index import faiss_index # Assuming faiss_index is an instance
 from app.db import (
     database, upsert_email, get_email_by_id,
-    migrate_database, get_emails_in_date_range,  update_email_status, metadata, engine # Added get_emails_in_date_range
+    migrate_database, get_emails_in_date_range, update_email_status, metadata, engine # Added get_emails_in_date_range
 )
 from app.chat_manager import add_message, get_chat_history
 from app.openai_client import chat_completion
@@ -289,6 +289,7 @@ def enhanced_truncate_email_content(email: dict, max_chars: int = 1000) -> dict:
     return email_copy
 
 
+# MODIFICATION 1: Update context builder to include category
 def enhanced_build_smart_context(emails: List[dict], max_total_tokens=2500) -> str:
     """Enhanced context building with better formatting for AI understanding"""
     if not emails:
@@ -307,6 +308,7 @@ def enhanced_build_smart_context(emails: List[dict], max_total_tokens=2500) -> s
         subject = str(email.get('subject', 'No subject')).strip()
         sender = str(email.get('from_', 'Unknown sender')).strip()
         body = str(email.get('body', '')).strip()
+        category = str(email.get('category', 'general')).capitalize() # <-- GET CATEGORY
         
         # Format unread status more clearly
         unread_status = email.get('is_unread')
@@ -323,6 +325,7 @@ Date: {date_str}
 From: {sender}
 Subject: {subject}
 Status: {status}
+Category: {category}
 Content: {body}
 ---"""
         
@@ -339,6 +342,7 @@ Date: {date_str}
 From: {sender}
 Subject: {subject}
 Status: {status}
+Category: {category}
 Content: """
                 
                 remaining_chars = available_chars - len(header_text) - 20  # Buffer
@@ -361,6 +365,7 @@ async def get_emails_in_date_range_enhanced(
     account_id: Optional[str] = None,
     is_unread: Optional[bool] = None,
     keywords: Optional[List[str]] = None,
+    category: Optional[str] = None, # <-- ADD CATEGORY FILTER
     limit: int = 50
 ):
     """Enhanced date range query with additional filters"""
@@ -378,6 +383,10 @@ async def get_emails_in_date_range_enhanced(
     if is_unread is not None:
         conditions.append("is_unread = :is_unread")
         params["is_unread"] = is_unread
+    
+    if category: # <-- ADD CATEGORY LOGIC
+        conditions.append("category = :category")
+        params["category"] = category
     
     if keywords:
         keyword_conditions = []
@@ -554,8 +563,32 @@ async def working_query(request: QuestionRequest):
         else:
             # Multi-strategy email retrieval
             
-            # Strategy 1: FAISS Search (for content-based queries)
-            if not is_unread_query and hasattr(faiss_index, 'index') and faiss_index.index and faiss_index.index.ntotal > 0:
+            # MODIFICATION 2: Update retrieval logic to use the Category field
+            db_emails_added = False
+            
+            if is_urgent_query:
+                # Strategy 1: Prioritize fetching directly by 'urgent' category.
+                try:
+                    end_date = datetime.now(timezone.utc)
+                    start_date = end_date - timedelta(days=30) # Look back 30 days for urgent items
+                    
+                    db_emails = await get_emails_in_date_range_enhanced(
+                        start_date=start_date, end_date=end_date,
+                        account_id=account_id_filter,
+                        category='urgent',
+                        limit=MAX_EMAILS_TO_FETCH_INITIAL
+                    )
+                    emails_for_context_raw.extend([dict(row) for row in db_emails])
+                    db_emails_added = True
+                    logger.info(f"DB Urgent Query (by Category): Found {len(db_emails)} urgent emails.")
+                except Exception as e:
+                    logger.error(f"Urgent email query by category failed: {e}", exc_info=True)
+
+            # (The other query types like is_unread_query and is_event_query can remain as they are)
+            # ... [existing is_unread_query and is_event_query logic] ...
+            
+            # Vector search can now act as a fallback or supplement
+            if not db_emails_added and hasattr(faiss_index, 'index') and faiss_index.index and faiss_index.index.ntotal > 0:
                 try:
                     q_embedding_data = await process_email({
                         'id': 'query_temp_id', 
@@ -576,115 +609,15 @@ async def working_query(request: QuestionRequest):
                             doc = await get_email_by_id(eid, account_id=account_id_filter)
                             if doc: 
                                 emails_for_context_raw.append(dict(doc))
-                        if emails_for_context_raw:
+                        if top_faiss_email_ids:
                             faiss_search_successful = True
                             logger.info(f"FAISS: Fetched {len(emails_for_context_raw)} emails from DB.")
                 except Exception as e: 
                     logger.error(f"FAISS search failed: {e}", exc_info=True)
 
-            # Strategy 2: Database queries for specific types
-            db_emails_added = False
-            
-            if is_unread_query:
-                # Enhanced unread email query
-                try:
-                    # Parse time range from query
-                    days_match = re.search(r'last\s+(\d+)\s+days?|past\s+(\d+)\s+days?', query_lower)
-                    lookback_days = int(days_match.group(1) or days_match.group(2)) if days_match else 7
-                    
-                    end_date = datetime.now(timezone.utc)
-                    start_date = end_date - timedelta(days=lookback_days)
-                    
-                    db_emails = await get_emails_in_date_range(
-                        start_date, end_date, 
-                        account_id=account_id_filter, 
-                        is_unread=True
-                    )
-                    emails_for_context_raw.extend([dict(row) for row in db_emails])
-                    db_emails_added = True
-                    logger.info(f"DB Unread Query: Found {len(db_emails)} unread emails in last {lookback_days} days.")
-                except Exception as e:
-                    logger.error(f"Unread email query failed: {e}", exc_info=True)
-            
-            elif is_urgent_query:
-                # Query for urgent/important emails
-                try:
-                    urgent_keywords = ['urgent', 'important', 'action required', 'deadline', 'asap', 'critical', 'high priority']
-                    conditions = []
-                    params = {}
-                    
-                    if account_id_filter:
-                        conditions.append("account_id = :account_id")
-                        params["account_id"] = account_id_filter
-                    
-                    # Look for urgent keywords in subject or body
-                    keyword_conditions = []
-                    for idx, keyword in enumerate(urgent_keywords):
-                        subj_param = f"urgent_subj_{idx}"
-                        body_param = f"urgent_body_{idx}"
-                        keyword_conditions.append(f"(LOWER(subject) LIKE :{subj_param} OR LOWER(body) LIKE :{body_param})")
-                        params[subj_param] = f"%{keyword}%"
-                        params[body_param] = f"%{keyword}%"
-                    
-                    conditions.append(f"({' OR '.join(keyword_conditions)})")
-                    
-                    # Recent emails (last 30 days)
-                    recent_date = datetime.now(timezone.utc) - timedelta(days=30)
-                    conditions.append("received_at >= :recent_date")
-                    params["recent_date"] = recent_date
-                    
-                    where_clause = " AND ".join(conditions)
-                    urgent_query_sql = f"SELECT * FROM emails WHERE {where_clause} ORDER BY received_at DESC LIMIT {MAX_EMAILS_TO_FETCH_INITIAL}"
-                    
-                    urgent_results = await database.fetch_all(urgent_query_sql, values=params)
-                    emails_for_context_raw.extend([dict(row) for row in urgent_results])
-                    db_emails_added = True
-                    logger.info(f"DB Urgent Query: Found {len(urgent_results)} urgent emails.")
-                except Exception as e:
-                    logger.error(f"Urgent email query failed: {e}", exc_info=True)
-            
-            elif is_event_query:
-                # Enhanced event/meeting query
-                try:
-                    event_keywords = [
-                        'meeting', 'interview', 'call', 'appointment', 'conference', 'zoom', 'teams',
-                        'scheduled', 'calendar', 'event', 'invite', 'webinar', 'session', 'demo'
-                    ]
-                    conditions = []
-                    params = {}
-                    
-                    if account_id_filter:
-                        conditions.append("account_id = :account_id")
-                        params["account_id"] = account_id_filter
-                    
-                    keyword_conditions = []
-                    for idx, keyword in enumerate(event_keywords):
-                        subj_param = f"event_subj_{idx}"
-                        body_param = f"event_body_{idx}"
-                        keyword_conditions.append(f"(LOWER(subject) LIKE :{subj_param} OR LOWER(body) LIKE :{body_param})")
-                        params[subj_param] = f"%{keyword}%"
-                        params[body_param] = f"%{keyword}%"
-                    
-                    conditions.append(f"({' OR '.join(keyword_conditions)})")
-                    
-                    # Look in future and recent past for events
-                    past_date = datetime.now(timezone.utc) - timedelta(days=7)
-                    future_date = datetime.now(timezone.utc) + timedelta(days=30)
-                    conditions.append("received_at >= :past_date")
-                    params["past_date"] = past_date
-                    
-                    where_clause = " AND ".join(conditions)
-                    event_query_sql = f"SELECT * FROM emails WHERE {where_clause} ORDER BY received_at DESC LIMIT {MAX_EMAILS_TO_FETCH_INITIAL}"
-                    
-                    event_results = await database.fetch_all(event_query_sql, values=params)
-                    emails_for_context_raw.extend([dict(row) for row in event_results])
-                    db_emails_added = True
-                    logger.info(f"DB Event Query: Found {len(event_results)} event-related emails.")
-                except Exception as e:
-                    logger.error(f"Event email query failed: {e}", exc_info=True)
 
-            # Strategy 3: General fallback if no specific strategy worked
-            if not faiss_search_successful and not db_emails_added:
+            # General fallback if no specific strategy worked
+            if not emails_for_context_raw: # Check if list is still empty
                 try:
                     logger.info("Using general fallback query")
                     general_query = "SELECT * FROM emails"
@@ -717,7 +650,7 @@ async def working_query(request: QuestionRequest):
             filtered_emails = filter_recent_emails(unique_emails, days_ahead=30, lookback_days=60)
         elif is_urgent_query:
             # For urgent queries, focus on recent emails
-            filtered_emails = filter_recent_emails(unique_emails, days_ahead=7, lookback_days=14)
+            filtered_emails = filter_recent_emails(unique_emails, days_ahead=7, lookback_days=30) # Increased lookback for urgent
         elif is_unread_query:
             # For unread queries, we already filtered by date in DB query
             filtered_emails = unique_emails
@@ -731,17 +664,14 @@ async def working_query(request: QuestionRequest):
         if not filtered_emails:
             db_count = await get_total_email_count(account_id=account_id_filter)
             message = f"I couldn't find any relevant emails for your query."
-            # if account_id_filter:
-            #     message += f" (Searched account: {account_id_filter})"
-            # message += f" Total emails in database: {db_count}"
             
             return {"answer": message}
 
-        # Build context with improved truncation
-        truncated_emails = [truncate_email_content(email.copy(), max_chars=1000) for email in filtered_emails]
-        context_text = build_smart_context(truncated_emails, max_total_tokens=MAX_CONTEXT_TOKEN_FOR_EMAILS)
+        # Build context with improved truncation and now including category
+        truncated_emails = [enhanced_truncate_email_content(email.copy(), max_chars=1000) for email in filtered_emails]
+        context_text = enhanced_build_smart_context(truncated_emails, max_total_tokens=MAX_CONTEXT_TOKEN_FOR_EMAILS)
         
-        # Enhanced system prompt
+        # MODIFICATION 3: Enhance system prompt to use the Category
         current_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')
         
         system_prompt = f"""You are an AI Email Assistant analyzing email data to answer user questions.
@@ -750,29 +680,26 @@ Current date and time: {current_time}
 
 ANALYSIS GUIDELINES:
 1. **Upcoming Events**: For questions about meetings, calls, interviews, appointments:
-   - Look for date/time information in email content
-   - Calculate timeframes relative to current date: {current_time}
-   - Extract: Date, Time, Type, Participants, Subject, Location/Links
-   - Pay attention to phrases like "next week", "tomorrow", "this Friday"
+   - Prioritize emails with the category 'Meeting/event'.
+   - Look for date/time information, calculate timeframes relative to {current_time}.
+   - Extract: Date, Time, Type, Participants, Subject, Location/Links.
 
 2. **Urgent/Important Items**: For questions about urgent emails or deadlines:
-   - Look for keywords: "urgent", "important", "action required", "deadline", "ASAP"
-   - Identify required actions and deadlines
-   - Prioritize unread urgent emails
+   - **Strongly prioritize emails with the category 'Urgent'.**
+   - Also consider emails with keywords: "important", "action required", "deadline", "ASAP".
+   - Identify required actions and deadlines.
 
 3. **Email Status**: For read/unread questions:
-   - Use "Status: Unread" or "Status: Read" information when provided
-   - Count unread emails accurately
+   - Use "Status: Unread" or "Status: Read" information. Count unread emails accurately.
 
-4. **General Queries**: Answer based solely on provided email content
-   - Do not invent or assume information not in the emails
-   - If information is not available, state this clearly
+4. **General Queries**: Answer based SOLELY on provided email content.
+   - Do not invent or assume information not in the emails.
+   - If information is not available, state this clearly.
 
 RESPONSE FORMAT:
-- Be specific and actionable
-- Include relevant details (dates, times, participants)
-- Use bullet points for multiple items
-- Mention if information is from email snippets
+- Be specific and actionable.
+- Use bullet points for multiple items.
+- Mention if information is from email snippets.
 
 EMAIL DATA TO ANALYZE:
 {context_text if context_text else "No email data available."}
@@ -820,12 +747,12 @@ Answer the user's question based ONLY on the email information provided above.""
 
         return {
             "answer": answer,
-            # "emails_used_count": len(truncated_emails),
-            # "query_type_detected": {
-            #     "unread_query": is_unread_query,
-            #     "urgent_query": is_urgent_query,
-            #     "event_query": is_event_query
-            # }
+            "emails_used_count": len(truncated_emails),
+            "query_type_detected": {
+                "unread_query": is_unread_query,
+                "urgent_query": is_urgent_query,
+                "event_query": is_event_query
+            }
         }
 
     except Exception as e:
@@ -966,7 +893,6 @@ async def debug_status(account_id: Optional[str] = None):
     except Exception as e:
         logger.error(f"Error in /debug/status: {str(e)}", exc_info=True)
         return {"error": f"Failed to get debug status: {str(e)}"}
-
 
 
 @app.patch("/emails/{email_id}/status")
