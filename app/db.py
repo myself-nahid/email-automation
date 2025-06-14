@@ -171,8 +171,14 @@ async def upsert_email(email_doc: dict):
         "category": email_doc.get('category', 'general'),
         "embedding": embedding_bytes,
         "full_text_for_embedding": email_doc.get('full_text_for_embedding', ''),
-        "is_unread": email_doc.get('is_unread'), # Can be True, False, or None
     }
+
+    # Only add 'is_unread' to the values dict if it's explicitly provided (not None).
+    # This allows the database/SQLAlchemy default to apply on INSERTs,
+    # and prevents overwriting existing values with NULL on UPDATEs if not specified.
+    is_unread_status = email_doc.get('is_unread')
+    if is_unread_status is not None:
+        values_to_insert_update['is_unread'] = is_unread_status
 
     query = emails.select().where(emails.c.email_id == email_doc['email_id'])
     existing = await database.fetch_one(query)
@@ -240,5 +246,3 @@ async def get_chat_history(conversation_id: str, limit: int = 20):
     )
     rows = await database.fetch_all(query)
     return list(reversed(rows))  # Reverse to get oldest first for chat display
-
-# --- END OF FILE db.py ---
