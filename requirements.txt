@@ -1,4 +1,5 @@
-# Core dependencies
+# --- START OF FILE requirements.txt ---
+
 fastapi>=0.109.0
 uvicorn>=0.27.0
 pydantic>=2.5.0
@@ -6,12 +7,6 @@ openai
 numpy
 python-dateutil
 faiss-cpu
-databases
-sqlalchemy
+databases[sqlite]
 aiosqlite
-tenacity
 python-dotenv
-setuptools
-wheel
-typing-extensions
-email-validator>=2.1.0

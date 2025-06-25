@@ -31,7 +31,7 @@ def extract_metadata(email_data: dict, account_id: str) -> dict:
     body = ' '.join(str(body_raw).split()) if body_raw else ''
 
     received_at_str = email_data.get('date') or email_data.get('received_at')
-    is_unread_status = email_data.get('is_unread') # Get is_unread from input
+    is_unread_status = email_data.get('is_unread')
     received_at_dt = None
 
     if received_at_str:
@@ -41,23 +41,18 @@ def extract_metadata(email_data: dict, account_id: str) -> dict:
             elif isinstance(received_at_str, (int, float)):
                  received_at_dt = datetime.fromtimestamp(received_at_str, tz=timezone.utc)
             elif isinstance(received_at_str, str):
-                if received_at_str.endswith('Z'):
-                    received_at_dt = datetime.fromisoformat(received_at_str.replace('Z', '+00:00'))
-                else:
-                    received_at_dt = parse_date(received_at_str)
+                received_at_dt = parse_date(received_at_str)
             else:
-                logger.warning(f"Unparseable date type for email {email_id}: {type(received_at_str)}. Using current time.")
                 received_at_dt = datetime.now(timezone.utc)
 
-            if received_at_dt.tzinfo is None or received_at_dt.tzinfo.utcoffset(received_at_dt) is None:
+            if received_at_dt.tzinfo is None:
                 received_at_dt = received_at_dt.replace(tzinfo=timezone.utc)
             else:
                 received_at_dt = received_at_dt.astimezone(timezone.utc)
         except Exception as e:
-            logger.warning(f"Date parsing error for email {email_id} (raw date: '{received_at_str}'): {e}. Using current UTC time.")
+            logger.warning(f"Date parsing error for email {email_id}: {e}. Using current time.")
             received_at_dt = datetime.now(timezone.utc)
     else:
-        logger.warning(f"No date found for email {email_id}. Using current UTC time.")
         received_at_dt = datetime.now(timezone.utc)
         
     category = "general"
@@ -76,8 +71,8 @@ def extract_metadata(email_data: dict, account_id: str) -> dict:
         "subject": str(subject),
         "from_": str(from_),
         "body": str(body),
-        "received_at": received_at_dt.isoformat(), # Store as ISO string
-        "is_unread": is_unread_status, # Store the boolean or None
+        "received_at": received_at_dt.isoformat(),
+        "is_unread": is_unread_status,
         "category": category,
     }
 
@@ -86,31 +81,23 @@ async def process_email(email_data: dict, generate_embedding_only: bool = False)
     account_id = email_data.get('account_id')
 
     if not email_id:
-        logger.error("Error processing email: 'id' is missing from email_data.")
         raise ProcessEmailError("'id' is missing from email_data.")
-    if not account_id:
-        if not generate_embedding_only:
-            logger.error(f"Error processing email {email_id}: 'account_id' is missing.")
-            raise ProcessEmailError(f"'account_id' is missing for email {email_id}.")
-        account_id = account_id or "temp_query_account"
+    if not account_id and not generate_embedding_only:
+        raise ProcessEmailError(f"'account_id' is missing for email {email_id}.")
+    
+    account_id = account_id or "temp_query_account"
 
     try:
         metadata = extract_metadata(email_data, account_id)
         
-        # Only generate embedding if explicitly requested or if this is a new email
         if generate_embedding_only or not email_data.get('skip_embedding', False):
             text_for_embedding = f"Subject: {metadata.get('subject', '')}\nFrom: {metadata.get('from_', '')}\nBody: {metadata.get('body', '')[:2000]}"
-
             embedding_vector = await get_embedding(text_for_embedding)
-            if embedding_vector is None or not isinstance(embedding_vector, np.ndarray):
-                logger.error(f"Embedding generation failed for email {email_id}. get_embedding returned: {embedding_vector}")
+            if embedding_vector is None:
                 raise ProcessEmailError(f"Embedding generation failed for email {email_id}.")
-
-            embedding_bytes = embedding_to_bytes(embedding_vector)
-            metadata['embedding'] = embedding_bytes
+            
+            metadata['embedding'] = embedding_to_bytes(embedding_vector)
             metadata['full_text_for_embedding'] = text_for_embedding
-        else:
-            logger.info(f"Skipping embedding generation for email {email_id} as requested")
 
         if generate_embedding_only:
             return {
@@ -121,10 +108,7 @@ async def process_email(email_data: dict, generate_embedding_only: bool = False)
         return metadata
         
     except Exception as e:
-        logger.error(f"Error during processing of email {email_id} (Account: {account_id}): {str(e)}", exc_info=True)
+        logger.error(f"Error processing email {email_id}: {str(e)}", exc_info=True)
         if isinstance(e, ProcessEmailError):
             raise
         raise ProcessEmailError(f"Failed to process email {email_id}: {e}") from e
-
-# --- END OF FILE email_processor.py ---
-
