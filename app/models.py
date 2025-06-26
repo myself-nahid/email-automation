@@ -1,8 +1,7 @@
 # --- START OF FILE models.py ---
 
 from pydantic import BaseModel, Field, model_validator
-from typing import List, Optional, Union
-from datetime import datetime
+from typing import List, Optional
 
 class EmailInput(BaseModel):
     id: str
@@ -35,7 +34,9 @@ class EmailStatusUpdate(BaseModel):
 class QuestionRequest(BaseModel):
     question: str
     conversation_id: Optional[str] = None
-    account_id: Optional[str] = None
+    email_id: Optional[str] = None
+    # MODIFICATION: account_id is no longer Optional. It is a required string.
+    account_id: str
 
 class ChatMessage(BaseModel):
     conversation_id: str
